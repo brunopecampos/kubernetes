@@ -117,17 +117,35 @@ type DiffOptions struct {
 	pruner           *pruner
 }
 
-func NewDiffOptions(ioStreams genericclioptions.IOStreams) *DiffOptions {
-	return &DiffOptions{
-		Diff: &DiffProgram{
-			Exec:      exec.New(),
-			IOStreams: ioStreams,
-		},
-	}
+// DiffFlags directly reflect the information that CLI is gathering via flags.  They will be converted to Options, which
+// reflect the runtime requirements for the command.  This structure reduces the transformation to wiring and makes
+// the logic itself easy to unit test
+type DiffFlags struct {
+	FilenameOptions resource.FilenameOptions
+
+	ServerSideApply   bool
+	FieldManager      string
+	ForceConflicts    bool
+	ShowManagedFields bool
+
+	Selector string
 }
 
+// AddFlags registers flags for a cli
+func (f *DiffFlags) AddFlags(cmd *cobra.Command) {
+	usage := "contains the configuration to diff"
+	cmd.Flags().StringArray("prune-allowlist", []string{}, "Overwrite the default whitelist with <group/version/kind> for --prune")
+	cmd.Flags().Bool("prune", false, "Include resources that would be deleted by pruning. Can be used with -l and default shows all resources would be pruned")
+	cmd.Flags().BoolVar(&f.ShowManagedFields, "show-managed-fields", f.ShowManagedFields, "If true, include managed fields in the diff.")
+	cmdutil.AddFilenameOptionFlags(cmd, &f.FilenameOptions, usage)
+	cmdutil.AddServerSideApplyFlags(cmd)
+	cmdutil.AddFieldManagerFlagVar(cmd, &f.FieldManager, apply.FieldManagerClientSideApply)
+	cmdutil.AddLabelSelectorFlagVar(cmd, &f.Selector)
+}
+
+// NewCmdDiff creates the `diff` command
 func NewCmdDiff(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.Command {
-	options := NewDiffOptions(streams)
+	flags := &DiffFlags{}
 	cmd := &cobra.Command{
 		Use:                   "diff -f FILENAME",
 		DisableFlagsInUseLine: true,
@@ -135,7 +153,8 @@ func NewCmdDiff(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.C
 		Long:                  diffLong,
 		Example:               diffExample,
 		Run: func(cmd *cobra.Command, args []string) {
-			cmdutil.CheckDiffErr(options.Complete(f, cmd, args))
+			options, err := flags.ToOptions(f, cmd, args, streams)
+			cmdutil.CheckDiffErr(err)
 			cmdutil.CheckDiffErr(options.Validate())
 			// `kubectl diff` propagates the error code from
 			// diff or `KUBECTL_EXTERNAL_DIFF`. Also, we
@@ -160,15 +179,7 @@ func NewCmdDiff(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.C
 		return nil
 	})
 
-	usage := "contains the configuration to diff"
-	cmd.Flags().StringArray("prune-allowlist", []string{}, "Overwrite the default whitelist with <group/version/kind> for --prune")
-	cmd.Flags().Bool("prune", false, "Include resources that would be deleted by pruning. Can be used with -l and default shows all resources would be pruned")
-	cmd.Flags().BoolVar(&options.ShowManagedFields, "show-managed-fields", options.ShowManagedFields, "If true, include managed fields in the diff.")
-	cmdutil.AddFilenameOptionFlags(cmd, &options.FilenameOptions, usage)
-	cmdutil.AddServerSideApplyFlags(cmd)
-	cmdutil.AddFieldManagerFlagVar(cmd, &options.FieldManager, apply.FieldManagerClientSideApply)
-	cmdutil.AddLabelSelectorFlagVar(cmd, &options.Selector)
-
+	flags.AddFlags(cmd)
 	return cmd
 }
 
@@ -613,57 +624,82 @@ func isConflict(err error) bool {
 	return err != nil && errors.IsConflict(err)
 }
 
-func (o *DiffOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []string) error {
+// ToOptions converts from CLI inputs to runtime inputs
+func (flags *DiffFlags) ToOptions(f cmdutil.Factory, cmd *cobra.Command, args []string, ioStreams genericclioptions.IOStreams) (*DiffOptions, error) {
 	if len(args) != 0 {
-		return cmdutil.UsageErrorf(cmd, "Unexpected args: %v", args)
+		return nil, cmdutil.UsageErrorf(cmd, "Unexpected args: %v", args)
 	}
 
 	var err error
 
-	err = o.FilenameOptions.RequireFilenameOrKustomize()
+	err = flags.FilenameOptions.RequireFilenameOrKustomize()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	o.ServerSideApply = cmdutil.GetServerSideApplyFlag(cmd)
-	o.FieldManager = apply.GetApplyFieldManagerFlag(cmd, o.ServerSideApply)
-	o.ForceConflicts = cmdutil.GetForceConflictsFlag(cmd)
-	if o.ForceConflicts && !o.ServerSideApply {
-		return fmt.Errorf("--force-conflicts only works with --server-side")
+	flags.ServerSideApply = cmdutil.GetServerSideApplyFlag(cmd)
+	flags.FieldManager = apply.GetApplyFieldManagerFlag(cmd, flags.ServerSideApply)
+	flags.ForceConflicts = cmdutil.GetForceConflictsFlag(cmd)
+	if flags.ForceConflicts && !flags.ServerSideApply {
+		return nil, fmt.Errorf("--force-conflicts only works with --server-side")
 	}
 
-	if !o.ServerSideApply {
-		o.OpenAPISchema, err = f.OpenAPISchema()
+	var openAPISchema openapi.Resources
+	if !flags.ServerSideApply {
+		openAPISchema, err = f.OpenAPISchema()
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
-	o.DynamicClient, err = f.DynamicClient()
+	dynamicClient, err := f.DynamicClient()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	o.CmdNamespace, o.EnforceNamespace, err = f.ToRawKubeConfigLoader().Namespace()
+	cmdNamespace, enforceNamespace, err := f.ToRawKubeConfigLoader().Namespace()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
+	var p *pruner
 	if cmdutil.GetFlagBool(cmd, "prune") {
 		mapper, err := f.ToRESTMapper()
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		resources, err := prune.ParseResources(mapper, cmdutil.GetFlagStringArray(cmd, "prune-allowlist"))
 		if err != nil {
-			return err
+			return nil, err
 		}
-		o.pruner = newPruner(o.DynamicClient, mapper, resources, o.Selector)
+		p = newPruner(dynamicClient, mapper, resources, flags.Selector)
 	}
 
-	o.Builder = f.NewBuilder()
-	return nil
+	builder := f.NewBuilder()
+
+	diff := &DiffProgram{
+		Exec:      exec.New(),
+		IOStreams: ioStreams,
+	}
+
+	return &DiffOptions{
+		FilenameOptions: flags.FilenameOptions,
+
+		ServerSideApply:   flags.ServerSideApply,
+		FieldManager:      flags.FieldManager,
+		ForceConflicts:    flags.ForceConflicts,
+		ShowManagedFields: flags.ShowManagedFields,
+
+		Selector:         flags.Selector,
+		OpenAPISchema:    openAPISchema,
+		DynamicClient:    dynamicClient,
+		CmdNamespace:     cmdNamespace,
+		EnforceNamespace: enforceNamespace,
+		Builder:          builder,
+		Diff:             diff,
+		pruner:           p,
+	}, nil
 }
 
 // Run uses the factory to parse file arguments, find the version to
